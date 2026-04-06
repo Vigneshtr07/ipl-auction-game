@@ -121,19 +121,30 @@ export default function App() {
     };
   });
   // Firebase real-time room sync
-useEffect(() => {
-  if (screen !== 'roomLobby' || !roomCode) return;
+ useEffect(() => {
+  if (!roomCode) return; // roomLobby check-ah remove pannuvom, appo dhaan ellamae sync aagum
+
   const unsubscribe = listenRoom(roomCode, (roomData) => {
+    // 1. Players list-ah sync pannum
     if (roomData?.players) {
       setMultiTeams(roomData.players);
     }
-    if (roomData?.status === 'started' && !isHost) {
-      setAuctionType(roomData.auctionType);
-      setScreen(roomData.auctionType === 'mega' ? 'retention' : 'auction');
+    
+    // 2. Room Lobby-la irundhu Retention/Auction-ku poga (Lobby Sync)
+    if (roomData?.status === 'started' && screen === 'roomLobby') {
+       setAuctionType(roomData.auctionType);
+       setScreen(roomData.auctionType === 'mega' ? 'retention' : 'auction');
+    }
+
+    // 3. 👇 IDHU DHAAN PUDHU CODE: Retention mudinju Auction-ku sync panna
+    // Room status 'auction_live' aana, automatic-ah screen 'auction'-ku maarum
+    if (roomData?.status === 'auction_live' && screen === 'retention') {
+       setScreen('auction');
     }
   });
+
   return unsubscribe;
-}, [screen, roomCode, isHost]);
+}, [roomCode, screen]); // Dependency list-layum 'screen' irukanum
 
   const pool = () => auctionType === 'mini' ? MINI_PLAYERS_2026 : MEGA_PLAYERS_2025;
 
@@ -829,9 +840,22 @@ useEffect(() => {
 
           <div className="row-btns" style={{marginTop:'20px',gap:'10px'}}>
             <button className="btn btn-outline btn-lg" onClick={()=>setRetentions(prev=>({...prev,[myTeamId]:[]}))}> Clear All</button>
-            <button className="btn btn-gold btn-lg" onClick={()=>startAuction({[myTeamId]: retentions[myTeamId]||[]})}>
-              Done → Start Auction ({myRet.length} retained)
-            </button>
+           <button 
+  className="btn btn-gold btn-lg" 
+  style={{flex: 1}}
+  onClick={async () => {
+    // 1. Host-ah irundha Firebase-la status-ah update pannanum
+    if (isHost) {
+      await updateRoomData(roomCode, { status: 'auction_live' });
+    }
+    
+    // 2. Retention data-ah save pannittu auction-ku poganum
+    // Indha startAuction function unga logic-padi retention data-ah sync pannum
+    startAuction({[myTeamId]: retentions[myTeamId]||[]});
+  }}
+>
+  Done → Start Auction ({myRet.length} retained)
+</button>
           </div>
         </div>
       </div>
