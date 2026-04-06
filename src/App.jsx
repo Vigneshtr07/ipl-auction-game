@@ -1,9 +1,9 @@
 import React,{useState,useEffect,useRef} from 'react';
+import {createRoom,joinRoom,listenRoom,updateRoomData,generateRoomCode} from './utils/roomStore.js';
 import {TEAMS,RETENTION_RULES,TOTAL_BUDGET} from './data/teams.js';
 import {MINI_PLAYERS_2026,MEGA_PLAYERS_2025,getSets} from './data/players.js';
 import {SQUADS_2025} from './data/squads2025.js';
-import {fmtCr,getBidIncrement,shuffle,generateRoomCode,ROLE_COLORS,CAT_COLORS,FLAG,isOverseas,aiShouldBid} from './utils/helpers.js';
-import {createRoom,joinRoom} from './utils/roomStore.js';
+import {fmtCr,getBidIncrement,shuffle,ROLE_COLORS,CAT_COLORS,FLAG,isOverseas,aiShouldBid} from './utils/helpers.js';
 import './styles/main.css';
 
 const pName = p => `${p.fn} ${p.ln}`;
@@ -120,6 +120,20 @@ export default function App() {
       sold,unsold,isAccelerated,finalizeWindow
     };
   });
+  // Firebase real-time room sync
+useEffect(() => {
+  if (screen !== 'roomLobby' || !roomCode) return;
+  const unsubscribe = listenRoom(roomCode, (roomData) => {
+    if (roomData?.players) {
+      setMultiTeams(roomData.players);
+    }
+    if (roomData?.status === 'started' && !isHost) {
+      setAuctionType(roomData.auctionType);
+      setScreen(roomData.auctionType === 'mega' ? 'retention' : 'auction');
+    }
+  });
+  return unsubscribe;
+}, [screen, roomCode, isHost]);
 
   const pool = () => auctionType === 'mini' ? MINI_PLAYERS_2026 : MEGA_PLAYERS_2025;
 
@@ -674,7 +688,11 @@ export default function App() {
           })}
         </div>
         {isHost
-          ? <button className="btn btn-gold btn-lg btn-full" onClick={()=>setScreen(auctionType==='mega'?'retention':'auction')}>
+            ? <button className="btn btn-gold btn-lg btn-full"
+      onClick={async () => {
+        await updateRoomData(roomCode, { status: 'started', auctionType });
+        setScreen(auctionType === 'mega' ? 'retention' : 'auction');
+      }}>
               Start {auctionType==='mega'?'Retention Phase':'Auction'} →
             </button>
           : <div style={{textAlign:'center',color:'var(--text-muted)',fontSize:'14px'}}>Waiting for host...</div>}
