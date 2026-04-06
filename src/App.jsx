@@ -645,16 +645,45 @@ useEffect(() => {
             </div>
           ))}
         </div>
-        <button className="btn btn-gold btn-lg btn-full" disabled={!myName.trim()||!joinCode||!myTeamId}
-          onClick={()=>{
-            const r = joinRoom(joinCode,myName,myTeamId);
-            if (!r) {setJoinError('Room not found!');return;}
-            if (r==='TEAM_TAKEN') {setJoinError('Team taken!');return;}
-            if (r==='ROOM_FULL')  {setJoinError('Room full! (max 10)');return;}
-            setIsHost(false); setRoomCode(joinCode);
-            setMultiTeams(r.players); setAuctionType(r.auctionType);
-            setScreen('roomLobby'); setJoinError('');
-          }}>Join Room →</button>
+        <button 
+  className="btn btn-gold btn-lg btn-full" 
+  disabled={!myName.trim() || !joinCode || !myTeamId}
+  onClick={async () => {
+    try {
+      setJoinError('Joining...'); 
+      
+      // 👇 Inga dhaan logic maarudhu (await use panrom)
+      const r = await joinRoom(joinCode, myName, myTeamId); 
+      
+      if (!r) { 
+        setJoinError('Room not found!'); 
+        return; 
+      }
+      if (r === 'TEAM_TAKEN') { 
+        setJoinError('Team taken!'); 
+        return; 
+      }
+      if (r === 'ROOM_FULL') { 
+        setJoinError('Room full! (max 10)'); 
+        return; 
+      }
+      
+      // Success case
+      setIsHost(false); 
+      setRoomCode(joinCode);
+      setMultiTeams(r.players); 
+      setAuctionType(r.auctionType);
+      setScreen('roomLobby'); 
+      setJoinError('');
+      
+    } catch (err) {
+      console.error(err);
+      setJoinError('Connection error. Try again!');
+    }
+  }}
+>
+  Join Room →
+</button>
       </div>
     </div>
   );
