@@ -150,18 +150,28 @@ export default function App() {
 
   // ── build player order ───────────────────────────────────────────────────────
   function buildOrder(retObj) {
-    const p = pool();
-    const retNames = new Set(Object.values(retObj||{}).flat().map(pName));
-    const avail = p.filter(x => !retNames.has(pName(x)));
-    const sets = {};
-    avail.forEach(x => {
-      if (!sets[x.set]) sets[x.set] = [];
-      sets[x.set].push(x);
+  const p = auctionType === 'mini' ? MINI_PLAYERS_2026 : MEGA_PLAYERS_2025;
+
+  // Collect ALL retained player names across all teams
+  const retainedNames = new Set();
+  Object.values(retObj || {}).forEach(teamRetained => {
+    teamRetained.forEach(player => {
+      retainedNames.add(player.name || `${player.fn} ${player.ln}`);
     });
-    const out = [];
-    Object.keys(sets).sort((a,b) => +a-+b).forEach(s => out.push(...shuffle(sets[s])));
-    return out;
-  }
+  });
+
+  // Filter out retained players from auction pool
+  const avail = p.filter(x => !retainedNames.has(`${x.fn} ${x.ln}`));
+
+  const sets = {};
+  avail.forEach(x => {
+    if (!sets[x.set]) sets[x.set] = [];
+    sets[x.set].push(x);
+  });
+  const out = [];
+  Object.keys(sets).sort((a,b) => +a-+b).forEach(s => out.push(...shuffle(sets[s])));
+  return out;
+}
 
   // ── start auction ────────────────────────────────────────────────────────────
   function startAuction(userRetObj) {
