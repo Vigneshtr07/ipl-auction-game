@@ -1,5 +1,5 @@
 import React,{useState,useEffect,useRef} from 'react';
-import {createRoom,joinRoom,listenRoom,updateRoomData,generateRoomCode} from './utils/roomStore.js';
+import { createRoom, joinRoom, listenRoom, updateRoomData, saveMyRetentions, markReady, generateRoomCode } from './utils/roomStore.js';
 import {TEAMS,RETENTION_RULES,TOTAL_BUDGET} from './data/teams.js';
 import {MINI_PLAYERS_2026,MEGA_PLAYERS_2025,getSets} from './data/players.js';
 import {SQUADS_2025} from './data/squads2025.js';
@@ -68,6 +68,8 @@ export default function App() {
   const [joinCode,setJoinCode]       = useState('');
   const [joinError,setJoinError]     = useState('');
   const [multiTeams,setMultiTeams]   = useState([]);
+  const [roomData, setRoomData]           = useState(null);   // full Firebase room object
+  const [myRetDone, setMyRetDone]         = useState(false);  // did I click Ready?
 
   // retention
   const [retentions,setRetentions]       = useState({});
@@ -145,6 +147,33 @@ export default function App() {
 
   return unsubscribe;
 }, [roomCode, screen]); // Dependency list-layum 'screen' irukanum
+// ── Firebase room sync ───────────────────────────────────────────────────────
+useEffect(() => {
+  if (!roomCode) return;
+  const unsubscribe = listenRoom(roomCode, (data) => {
+    setRoomData(data);
+
+    // Sync players list in lobby
+    if (data?.players) setMultiTeams(data.players);
+
+    // Friend gets moved to retention/auction when host starts
+    if (!isHost) {
+      if (data?.status === 'retention' && screen === 'roomLobby') {
+        setAuctionType(data.auctionType);
+        setScreen('retention');
+      }
+      if (data?.status === 'auction' && (screen === 'retention' || screen === 'roomLobby')) {
+        // Load all retentions from Firebase then start auction
+        if (data.retentions) {
+          setRetentions(data.retentions);
+        }
+        setAuctionType(data.auctionType);
+        startAuctionWithRetentions(data.retentions || {});
+      }
+    }
+  });
+  return unsubscribe;
+}, [roomCode, isHost, screen]);
 
   const pool = () => auctionType === 'mini' ? MINI_PLAYERS_2026 : MEGA_PLAYERS_2025;
 
@@ -197,26 +226,42 @@ export default function App() {
   Object.keys(sets).sort((a,b) => +a-+b).forEach(s => out.push(...shuffle(sets[s])));
   return out;
 }
-
-  // ── start auction ────────────────────────────────────────────────────────────
+// Start auction using retentions from Firebase (for non-host players)
+function startAuctionWithRetentions(retObj) {
+  const aiRet = auctionType === 'mega' ? buildAIRetentions(myTeamId, auctionType === 'mini' ? MINI_PLAYERS_2026 : MEGA_PLAYERS_2025) : {};
+  const fullRet = { ...aiRet, ...retObj };
+  const t = initTeams(fullRet);
+  setTeams(t);
+  setRetentions(fullRet);
+  const ord = buildOrder(fullRet);
+  setPlayers(ord); setPlayerIdx(0);
+  setSold([]); setUnsold([]);
+  setIsAccelerated(false); setSimulating(false); setFinalizeWindow(false);
+  setScreen('auction');
+}
   function startAuction(userRetObj) {
-    // AI teams also retain from their 2025 squads
-    const aiRet = auctionType === 'mega' ? buildAIRetentions(myTeamId, pool()) : {};
-    const fullRet = { ...aiRet, ...userRetObj };
-    // User's retentions override AI for user's own team
-    if (userRetObj[myTeamId]) fullRet[myTeamId] = userRetObj[myTeamId];
+  const aiRet = auctionType === 'mega' ? buildAIRetentions(myTeamId, auctionType === 'mini' ? MINI_PLAYERS_2026 : MEGA_PLAYERS_2025) : {};
+  const fullRet = { ...aiRet, ...userRetObj };
+  if (userRetObj[myTeamId]) fullRet[myTeamId] = userRetObj[myTeamId];
 
-    const t = initTeams(fullRet);
-    setTeams(t);
-    setRetentions(fullRet);
-    const ord = buildOrder(fullRet);
-    setPlayers(ord); setPlayerIdx(0);
-    setSold([]); setUnsold([]);
-    setIsAccelerated(false); setSimulating(false);
-    setFinalizeWindow(false);
-    setScreen('auction');
+  const t = initTeams(fullRet);
+  setTeams(t);
+  setRetentions(fullRet);
+  const ord = buildOrder(fullRet);
+  setPlayers(ord); setPlayerIdx(0);
+  setSold([]); setUnsold([]);
+  setIsAccelerated(false); setSimulating(false); setFinalizeWindow(false);
+
+  // If multiplayer — save to Firebase and notify friends
+  if (roomCode) {
+    updateRoomData(roomCode, {
+      status: 'auction',
+      retentions: fullRet,
+    });
   }
 
+  setScreen('auction');
+}
   // ── round init ───────────────────────────────────────────────────────────────
   useEffect(() => {
     if (screen === 'auction' && players.length > 0 && players[playerIdx]) {
@@ -727,10 +772,14 @@ export default function App() {
             );
           })}
         </div>
-        {isHost
-            ? <button className="btn btn-gold btn-lg btn-full"
+    {isHost
+  ? <button className="btn btn-gold btn-lg btn-full"
       onClick={async () => {
-        await updateRoomData(roomCode, { status: 'started', auctionType });
+        // Tell everyone to go to retention/auction
+        await updateRoomData(roomCode, {
+          status: auctionType === 'mega' ? 'retention' : 'auction',
+          auctionType,
+        });
         setScreen(auctionType === 'mega' ? 'retention' : 'auction');
       }}>
               Start {auctionType==='mega'?'Retention Phase':'Auction'} →
@@ -744,123 +793,212 @@ export default function App() {
   // RETENTION
   // ═══════════════════════════════════════════
   if (screen === 'retention') {
-    const squad     = SQUADS_2025[myTeamId]||[];
-    const myRet     = retentions[myTeamId]||[];
-    const myRetCost = myRet.reduce((s,p) => s+(p.retentionCost||0), 0);
+  const squad     = SQUADS_2025[myTeamId] || [];
+  const myRet     = retentions[myTeamId] || [];
+  const myRetCost = myRet.reduce((s, p) => s + (p.retentionCost || 0), 0);
 
-    return (
-      <div className={`app ${theme}`}>
-        <TopBar title={`Retain from ${myTeamId} 2025 Squad`} theme={theme} setTheme={setTheme}/>
+  // How many players are Ready
+  const readyCount  = Object.keys(roomData?.readyPlayers || {}).length;
+  const totalHumans = multiTeams.length;
+  const allReady    = readyCount >= totalHumans;
 
-        {/* Confirm popup */}
-        {confirmRetain && (
-          <div className="modal-backdrop" onClick={()=>setConfirmRetain(null)}>
-            <div className="modal-box" style={{maxWidth:'340px'}} onClick={e=>e.stopPropagation()}>
-              <div style={{fontSize:'16px',fontWeight:'700',marginBottom:'8px'}}>{pName(confirmRetain.player)}</div>
-              <div style={{fontSize:'13px',color:'var(--text-muted)',marginBottom:'16px'}}>
-                {confirmRetain.player.role} · {confirmRetain.player.cat} · {FLAG[confirmRetain.player.country]||''} {confirmRetain.player.country}
+  async function handleRetainAndReady() {
+    // Save my retentions to Firebase
+    if (roomCode) {
+      await saveMyRetentions(roomCode, myTeamId, myRet);
+      await markReady(roomCode, myTeamId);
+    }
+    setMyRetDone(true);
+
+    // If I'm host and everyone is ready → start auction
+    // If I'm host but not everyone ready → wait
+    // If I'm not host → just wait for host to start
+  }
+
+  async function handleHostStartAuction() {
+    // Merge Firebase retentions with my own
+    const firebaseRet = roomData?.retentions || {};
+    const mergedRet   = { ...firebaseRet, [myTeamId]: myRet };
+    startAuction(mergedRet);
+  }
+
+  return (
+    <div className={`app ${theme}`}>
+      <TopBar title={`Retention — ${myTeamId} 2025 Squad`} theme={theme} setTheme={setTheme} />
+
+      {/* Confirm popup */}
+      {confirmRetain && (
+        <div className="modal-backdrop" onClick={() => setConfirmRetain(null)}>
+          <div className="modal-box" style={{ maxWidth: '340px' }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: '16px', fontWeight: '700', marginBottom: '8px' }}>{pName(confirmRetain.player)}</div>
+            <div style={{ fontSize: '13px', color: 'var(--text-muted)', marginBottom: '16px' }}>
+              {confirmRetain.player.role} · {confirmRetain.player.cat} · {FLAG[confirmRetain.player.country] || ''} {confirmRetain.player.country}
+            </div>
+            <div style={{ background: 'var(--bg3)', borderRadius: '10px', padding: '14px', textAlign: 'center', marginBottom: '16px' }}>
+              <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Retention cost</div>
+              <div style={{ fontSize: '28px', fontWeight: '700', color: 'var(--gold)', fontFamily: 'var(--font-display)' }}>{fmtCr(confirmRetain.cost)}</div>
+              <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '4px' }}>
+                Budget remaining: {fmtCr(TOTAL_BUDGET - myRetCost - confirmRetain.cost)}
               </div>
-              <div style={{background:'var(--bg3)',borderRadius:'10px',padding:'14px',textAlign:'center',marginBottom:'16px'}}>
-                <div style={{fontSize:'12px',color:'var(--text-muted)'}}>Retention cost</div>
-                <div style={{fontSize:'28px',fontWeight:'700',color:'var(--gold)',fontFamily:'var(--font-display)'}}>{fmtCr(confirmRetain.cost)}</div>
-                <div style={{fontSize:'12px',color:'var(--text-muted)',marginTop:'4px'}}>
-                  Budget remaining: {fmtCr(TOTAL_BUDGET - myRetCost - confirmRetain.cost)}
-                </div>
-              </div>
-              <div style={{display:'flex',gap:'8px'}}>
-                <button className="btn btn-outline btn-lg" style={{flex:1}} onClick={()=>setConfirmRetain(null)}>Cancel</button>
-                <button className="btn btn-gold btn-lg" style={{flex:1}} onClick={()=>doRetain(myTeamId,confirmRetain.player,confirmRetain.cost)}>
-                  Retain @ {fmtCr(confirmRetain.cost)}
-                </button>
-              </div>
+            </div>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button className="btn btn-outline btn-lg" style={{ flex: 1 }} onClick={() => setConfirmRetain(null)}>Cancel</button>
+              <button className="btn btn-gold btn-lg" style={{ flex: 1 }} onClick={() => doRetain(myTeamId, confirmRetain.player, confirmRetain.cost)}>
+                Retain @ {fmtCr(confirmRetain.cost)}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="retention-screen">
+        {/* Budget bar */}
+        <div className="ret-budget-bar">
+          <div>
+            <div style={{ fontSize: '13px', color: 'var(--text-muted)' }}>Budget after retention</div>
+            <div style={{ fontSize: '22px', fontWeight: '700', color: 'var(--gold)' }}>{fmtCr(TOTAL_BUDGET - myRetCost)}</div>
+          </div>
+          <div style={{ textAlign: 'right' }}>
+            <div style={{ fontSize: '13px', color: 'var(--text-muted)' }}>Retained</div>
+            <div style={{ fontSize: '22px', fontWeight: '700' }}>{myRet.length}/5</div>
+          </div>
+        </div>
+
+        {/* Multiplayer status */}
+        {roomCode && (
+          <div style={{
+            background: 'var(--bg3)', border: '1px solid var(--border)',
+            borderRadius: 'var(--r-md)', padding: '10px 14px',
+            marginBottom: '14px', fontSize: '13px'
+          }}>
+            <div style={{ fontWeight: '600', marginBottom: '6px' }}>
+              Players ready: {readyCount}/{totalHumans}
+            </div>
+            <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+              {multiTeams.map((p, i) => {
+                const isReady = roomData?.readyPlayers?.[p.team];
+                const meta    = TEAMS.find(t => t.id === p.team);
+                return (
+                  <div key={i} style={{
+                    display: 'flex', alignItems: 'center', gap: '5px',
+                    background: isReady ? 'rgba(34,197,94,0.1)' : 'var(--bg2)',
+                    border: `1px solid ${isReady ? 'rgba(34,197,94,0.3)' : 'var(--border)'}`,
+                    borderRadius: '20px', padding: '3px 10px', fontSize: '12px'
+                  }}>
+                    <div style={{ width: '6px', height: '6px', borderRadius: '50%', background: meta?.color }} />
+                    <span>{p.name} ({p.team})</span>
+                    <span>{isReady ? '✓' : '⏳'}</span>
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}
 
-        <div className="retention-screen">
-          <div className="ret-budget-bar">
-            <div>
-              <div style={{fontSize:'13px',color:'var(--text-muted)'}}>Budget after retention</div>
-              <div style={{fontSize:'22px',fontWeight:'700',color:'var(--gold)'}}>{fmtCr(TOTAL_BUDGET-myRetCost)}</div>
-            </div>
-            <div style={{textAlign:'right'}}>
-              <div style={{fontSize:'13px',color:'var(--text-muted)'}}>Retained</div>
-              <div style={{fontSize:'22px',fontWeight:'700'}}>{myRet.length}/5</div>
-            </div>
-          </div>
-
-          <div className="rules-box" style={{marginBottom:'14px'}}>
-            <strong>Slot costs — click player to see & confirm:</strong><br/>
-            Indian Capped: <strong>18Cr → 14Cr → 11Cr</strong><br/>
-            Overseas Capped: <strong>18Cr → 14Cr</strong><br/>
-            Uncapped (any): <strong>4Cr</strong><br/>
-            Max 5 · Max 2 Overseas · Max 1 Uncapped · <strong>AI auto-retains for other 9 teams</strong>
-          </div>
-
-          {myRet.length > 0 && (
-            <div style={{marginBottom:'14px'}}>
-              <div className="field-label" style={{marginBottom:'8px'}}>Retained (click to remove)</div>
-              <div style={{display:'flex',flexWrap:'wrap',gap:'6px'}}>
-                {myRet.map((p,i) => (
-                  <div key={i} className="retained-pill" onClick={()=>removeRetain(myTeamId,p.name)}>
-                    {p.fn} {p.ln} <span style={{color:'var(--gold)'}}>@ {fmtCr(p.retentionCost)}</span> ✕
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          <div className="field-label" style={{marginBottom:'10px'}}>Your 2025 squad — click to retain</div>
-          <div className="ret-player-grid">
-            {squad.map((p,i) => {
-              const name    = pName(p);
-              const isRet   = myRet.find(r => r.name === name);
-              const cost    = getRetCost(myTeamId,p);
-              const canDo   = !isRet && canRetain(myTeamId,p);
-              const rc      = ROLE_COLORS[p.role]||ROLE_COLORS.Batter;
-              return (
-                <div key={i}
-                  className={`ret-player-card ${isRet?'retained':''} ${!isRet&&!canDo?'disabled':''}`}
-                  onClick={() => {
-                    if (isRet) { removeRetain(myTeamId,name); return; }
-                    if (canDo && cost) setConfirmRetain({player:p, teamId:myTeamId, cost});
-                  }}>
-                  <div style={{fontWeight:'600',fontSize:'13px'}}>{p.fn} {p.ln}</div>
-                  <div style={{display:'flex',gap:'4px',flexWrap:'wrap',marginTop:'4px'}}>
-                    <span className="mini-badge" style={{background:rc.bg,color:rc.text}}>{p.role.slice(0,4)}</span>
-                    <span className="mini-badge" style={{background:'var(--bg2)',color:'var(--text-muted)'}}>{FLAG[p.country]||''} {p.cat==='Uncapped'?'U':'C'}</span>
-                  </div>
-                  {isRet   && <div style={{fontSize:'11px',color:'var(--green)',marginTop:'3px'}}>✓ Retained @ {fmtCr(p.retentionCost)}</div>}
-                  {!isRet && canDo && cost && <div style={{fontSize:'11px',color:'var(--gold)',marginTop:'3px'}}>Click → {fmtCr(cost)}</div>}
-                  {!isRet && !canDo && <div style={{fontSize:'10px',color:'var(--red)',marginTop:'3px'}}>{cost===null?'Slot full':'—'}</div>}
-                </div>
-              );
-            })}
-          </div>
-
-          <div className="row-btns" style={{marginTop:'20px',gap:'10px'}}>
-            <button className="btn btn-outline btn-lg" onClick={()=>setRetentions(prev=>({...prev,[myTeamId]:[]}))}> Clear All</button>
-           <button 
-  className="btn btn-gold btn-lg" 
-  style={{flex: 1}}
-  onClick={async () => {
-    // 1. Host-ah irundha Firebase-la status-ah update pannanum
-    if (isHost) {
-      await updateRoomData(roomCode, { status: 'auction_live' });
-    }
-    
-    // 2. Retention data-ah save pannittu auction-ku poganum
-    // Indha startAuction function unga logic-padi retention data-ah sync pannum
-    startAuction({[myTeamId]: retentions[myTeamId]||[]});
-  }}
->
-  Done → Start Auction ({myRet.length} retained)
-</button>
-          </div>
+        <div className="rules-box" style={{ marginBottom: '14px' }}>
+          <strong>Slot costs — click player to see & confirm:</strong><br />
+          Indian Capped: <strong>18Cr → 14Cr → 11Cr</strong><br />
+          Overseas Capped: <strong>18Cr → 14Cr</strong><br />
+          Uncapped: <strong>4Cr</strong>
         </div>
+
+        {myRet.length > 0 && (
+          <div style={{ marginBottom: '14px' }}>
+            <div className="field-label" style={{ marginBottom: '8px' }}>Retained (click to remove)</div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+              {myRet.map((p, i) => (
+                <div key={i} className="retained-pill" onClick={() => !myRetDone && removeRetain(myTeamId, p.name)}>
+                  {p.fn} {p.ln} <span style={{ color: 'var(--gold)' }}>@ {fmtCr(p.retentionCost)}</span>
+                  {!myRetDone && ' ✕'}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {!myRetDone ? (
+          <>
+            {/* Player grid */}
+            <div className="field-label" style={{ marginBottom: '10px' }}>Your 2025 squad — click to retain</div>
+            <div className="ret-player-grid">
+              {squad.map((p, i) => {
+                const name  = pName(p);
+                const isRet = myRet.find(r => r.name === name);
+                const cost  = getRetCost(myTeamId, p);
+                const canDo = !isRet && canRetain(myTeamId, p);
+                const rc    = ROLE_COLORS[p.role] || ROLE_COLORS.Batter;
+                return (
+                  <div key={i}
+                    className={`ret-player-card ${isRet ? 'retained' : ''} ${!isRet && !canDo ? 'disabled' : ''}`}
+                    onClick={() => {
+                      if (isRet) { removeRetain(myTeamId, name); return; }
+                      if (canDo && cost) setConfirmRetain({ player: p, teamId: myTeamId, cost });
+                    }}>
+                    <div style={{ fontWeight: '600', fontSize: '13px' }}>{p.fn} {p.ln}</div>
+                    <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap', marginTop: '4px' }}>
+                      <span className="mini-badge" style={{ background: rc.bg, color: rc.text }}>{p.role.slice(0, 4)}</span>
+                      <span className="mini-badge" style={{ background: 'var(--bg2)', color: 'var(--text-muted)' }}>{FLAG[p.country] || ''} {p.cat === 'Uncapped' ? 'U' : 'C'}</span>
+                    </div>
+                    {isRet  && <div style={{ fontSize: '11px', color: 'var(--green)', marginTop: '3px' }}>✓ Retained @ {fmtCr(p.retentionCost)}</div>}
+                    {!isRet && canDo && cost && <div style={{ fontSize: '11px', color: 'var(--gold)', marginTop: '3px' }}>Click → {fmtCr(cost)}</div>}
+                    {!isRet && !canDo && <div style={{ fontSize: '10px', color: 'var(--red)', marginTop: '3px' }}>{cost === null ? 'Slot full' : '—'}</div>}
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="row-btns" style={{ marginTop: '20px', gap: '10px' }}>
+              <button className="btn btn-outline btn-lg" onClick={() => setRetentions(prev => ({ ...prev, [myTeamId]: [] }))}>
+                Clear All
+              </button>
+              {/* Solo play — no room */}
+              {!roomCode && (
+                <button className="btn btn-gold btn-lg" onClick={() => startAuction({ [myTeamId]: myRet })}>
+                  Done → Start Auction ({myRet.length} retained)
+                </button>
+              )}
+              {/* Multiplayer — mark ready */}
+              {roomCode && (
+                <button className="btn btn-gold btn-lg" onClick={handleRetainAndReady}>
+                  ✓ Done Retaining ({myRet.length} players) — Mark Ready
+                </button>
+              )}
+            </div>
+          </>
+        ) : (
+          /* After clicking Ready */
+          <div style={{
+            background: 'var(--bg3)', border: '1px solid var(--border)',
+            borderRadius: 'var(--r-lg)', padding: '20px', textAlign: 'center', marginTop: '16px'
+          }}>
+            <div style={{ fontSize: '20px', marginBottom: '8px' }}>✅</div>
+            <div style={{ fontWeight: '600', marginBottom: '4px' }}>
+              You're Ready! {myRet.length} players retained.
+            </div>
+            <div style={{ fontSize: '13px', color: 'var(--text-muted)', marginBottom: '16px' }}>
+              Waiting for others... ({readyCount}/{totalHumans} ready)
+            </div>
+
+            {/* Only HOST sees Start Auction button */}
+            {isHost && (
+              <button className="btn btn-gold btn-lg" onClick={handleHostStartAuction}
+                style={{ opacity: allReady ? 1 : 0.7 }}>
+                {allReady
+                  ? '🏏 Everyone Ready — Start Auction!'
+                  : `Start Anyway (${readyCount}/${totalHumans} ready)`}
+              </button>
+            )}
+            {!isHost && (
+              <div style={{ fontSize: '13px', color: 'var(--text-muted)' }}>
+                ⏳ Waiting for host ({multiTeams.find(t => t.isHost)?.name}) to start...
+              </div>
+            )}
+          </div>
+        )}
       </div>
-    );
-  }
+    </div>
+  );
+}
 
   // ═══════════════════════════════════════════
   // SUMMARY

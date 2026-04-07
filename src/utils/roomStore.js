@@ -4,7 +4,10 @@ export async function createRoom(code, hostTeam, hostName, auctionType) {
   const room = {
     code, hostTeam, hostName, auctionType,
     players: [{ name: hostName, team: hostTeam, isHost: true }],
-    status: 'waiting',
+    status: 'waiting',        // waiting | retention | started | auction
+    retentions: {},           // each team's retained players stored here
+    readyPlayers: {},         // who clicked Ready
+    auctionState: null,
     createdAt: Date.now(),
   };
   await set(ref(db, `rooms/${code}`), room);
@@ -33,6 +36,20 @@ export function listenRoom(code, callback) {
 
 export async function updateRoomData(code, data) {
   await update(ref(db, `rooms/${code}`), data);
+}
+
+// Save one team's retentions to Firebase
+export async function saveMyRetentions(code, teamId, retainedPlayers) {
+  await update(ref(db, `rooms/${code}/retentions`), {
+    [teamId]: retainedPlayers
+  });
+}
+
+// Mark myself as ready
+export async function markReady(code, teamId) {
+  await update(ref(db, `rooms/${code}/readyPlayers`), {
+    [teamId]: true
+  });
 }
 
 export function generateRoomCode() {
