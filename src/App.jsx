@@ -122,75 +122,65 @@ export default function App() {
       sold,unsold,isAccelerated,finalizeWindow
     };
   });
-  // Firebase real-time room sync
- useEffect(() => {
-  if (!roomCode) return;
-  const unsubscribe = listenRoom(roomCode, (data) => {
-    setRoomData(data);
-    if (data?.players) setMultiTeams(data.players);
+   // ── FIREBASE MASTER SYNC (REPLACE ALL OLD LISTENERS) ───────────────────────
+  useEffect(() => {
+    if (!roomCode) return;
 
-    if (!isHost) {
-      if (data?.status === 'retention' && screen === 'roomLobby') {
-        setAuctionType(data.auctionType);
-        setScreen('retention');
-      }
-      if (data?.status === 'auction' && screen !== 'auction') {
-        setAuctionType(data.auctionType);
-        // Pass playerOrder IDs and teams from Firebase!
-        startAuctionWithRetentions(
-          data.retentions || {},
-          data.playerOrder || [],   // ← same shuffled order
-          data.teams || []          // ← same team budgets
-        );
-      }
-    }
+    const unsubscribe = listenRoom(roomCode, (data) => {
+      setRoomData(data);
+      
+      // 1. Sync players list in lobby
+      if (data?.players) setMultiTeams(data.players);
 
-    // Sync ongoing auction state — bids, current player etc.
-    if (data?.auctionSync && screen === 'auction') {
-      const sync = data.auctionSync;
-      if (sync.currentBid !== undefined) setCurrentBid(sync.currentBid);
-      if (sync.bidLeader  !== undefined) setBidLeader(sync.bidLeader);
-      if (sync.playerIdx  !== undefined && sync.playerIdx !== playerIdx) {
-        setPlayerIdx(sync.playerIdx);
-      }
-      if (sync.teams) {
-        setTeams(TEAMS.map(tm => {
-          const fb = sync.teams.find(x => x.id === tm.id);
-          return fb ? { ...tm, ...fb } : tm;
-        }));
-      }
-    }
-  });
-  return unsubscribe;
-}, [roomCode, isHost, screen]); // Dependency list-layum 'screen' irukanum
-// ── Firebase room sync ───────────────────────────────────────────────────────
-useEffect(() => {
-  if (!roomCode) return;
-  const unsubscribe = listenRoom(roomCode, (data) => {
-    setRoomData(data);
-
-    // Sync players list in lobby
-    if (data?.players) setMultiTeams(data.players);
-
-    // Friend gets moved to retention/auction when host starts
-    if (!isHost) {
-      if (data?.status === 'retention' && screen === 'roomLobby') {
-        setAuctionType(data.auctionType);
-        setScreen('retention');
-      }
-      if (data?.status === 'auction' && (screen === 'retention' || screen === 'roomLobby')) {
-        // Load all retentions from Firebase then start auction
-        if (data.retentions) {
-          setRetentions(data.retentions);
+      // 2. Screen switching for Players (Non-Host)
+      if (!isHost) {
+        if (data?.status === 'retention' && screen === 'roomLobby') {
+          setAuctionType(data.auctionType);
+          setScreen('retention');
         }
-        setAuctionType(data.auctionType);
-        startAuctionWithRetentions(data.retentions || {});
+        
+        // Retention-la irundhu Auction-ku automatic-ah poga
+        if (data?.status === 'auction' && screen !== 'auction') {
+          setAuctionType(data.auctionType);
+          startAuctionWithRetentions(
+            data.retentions || {},
+            data.playerOrder || [],
+            data.teams || []
+          );
+        }
       }
-    }
-  });
-  return unsubscribe;
-}, [roomCode, isHost, screen]);
 
+      // 3. LIVE AUCTION SYNC (Bids, Timer, AI)
+      if (data?.auctionSync && screen === 'auction') {
+        const sync = data.auctionSync;
+
+        // BID & TIMER SYNC: Host or AI bid panna mobile-la update aagum
+        if (sync.currentBid !== undefined && sync.currentBid !== currentBid) {
+          setCurrentBid(sync.currentBid);
+          setBidLeader(sync.bidLeader);
+          setNoBidYet(false);
+          
+          // 👈 TIMER RESET: Sync aagumbothu timer-ah 15 or 8-ku reset panrom
+          setTimer(isAccelerated ? 8 : 15); 
+        }
+
+        // PLAYER INDEX SYNC: Adutha player-ku sync aagum
+        if (sync.playerIdx !== undefined && sync.playerIdx !== playerIdx) {
+          setPlayerIdx(sync.playerIdx);
+        }
+
+        // TEAMS BUDGET SYNC
+        if (sync.teams) {
+          setTeams(TEAMS.map(tm => {
+            const fb = sync.teams.find(x => x.id === tm.id);
+            return fb ? { ...tm, ...fb } : tm;
+          }));
+        }
+      }
+    });
+
+    return unsubscribe;
+  }, [roomCode, isHost, screen, currentBid, playerIdx]); // Dependency-la currentBid, playerIdx kandippa irukanum
   const pool = () => auctionType === 'mini' ? MINI_PLAYERS_2026 : MEGA_PLAYERS_2025;
 
   // ── helpers ─────────────────────────────────────────────────────────────────
@@ -442,46 +432,56 @@ function advance() {
   }
 
   // ── AI bidding ───────────────────────────────────────────────────────────────
+ // ── AI bidding (ONLY HOST RUNS THIS) ───────────────────────────────────────
   useEffect(() => {
-    if (screen !== 'auction' || phase !== 'bidding' || simulating) return;
+    // Host illai-na AI bid panna koodadhu, but results mobile-la theriyum
+    if (!isHost || screen !== 'auction' || phase !== 'bidding' || simulating) return;
+
     clearTimeout(aiRef.current);
-    const delay = finalizeWindow
-      ? 400 + Math.random()*500  // faster during finalize window
-      : isAccelerated
-        ? 400 + Math.random()*600
-        : 1200 + Math.random()*1600;
+    const delay = isAccelerated ? 600 : 1500;
 
     aiRef.current = setTimeout(() => {
-      const { phase:ph, teams:t, currentBid:cb, players:pl, playerIdx:idx, multiTeams:mt } = refs.current;
-      if (ph !== 'bidding' || !t || !pl[idx]) return;
-      const player     = pl[idx];
-      const humanTeams = (mt||[]).map(m => m.team);
-      const remaining  = pl.length - idx - 1;
+      const { currentBid: cb, players: pl, playerIdx: idx, teams: currentTeams } = refs.current;
+      const player = pl[idx];
+      if (!player) return;
 
-      const candidates = t.filter(tm => {
-        if (humanTeams.includes(tm.id)) return false;
-        if (!canBuy(tm, player)) return false;
-        return aiShouldBid(cb, tm, player, remaining) !== null;
-      });
-      if (!candidates.length) return;
+      // AI logic to find bidder
+      const bidders = TEAMS.filter(t => t.id !== myTeamId);
+      const bidder = bidders[Math.floor(Math.random() * bidders.length)];
+      const tState = currentTeams.find(t => t.id === bidder.id);
 
-      const bidder = candidates[Math.floor(Math.random()*candidates.length)];
-      const newBid = aiShouldBid(cb, bidder, player, remaining);
-      if (!newBid || newBid > bidder.budget) return;
+      if (!tState || tState.budget < cb + getBidIncrement(cb)) return;
 
-      setCurrentBid(newBid); setBidLeader(bidder.id);
-      setNoBidYet(false); setTimer(isAccelerated ? 8 : 15);
-      setBidHistory(h => [...h, { team:bidder.short, bid:newBid, isHuman:false }]);
-
-      // If in finalize window and AI bids — cancel finalize, reset timer
-      if (refs.current.finalizeWindow) {
-        clearInterval(finalizeRef.current);
-        setFinalizeWindow(false);
+      const chance = isAccelerated ? 0.4 : 0.7;
+      if (Math.random() < chance) {
+        const newBid = cb + getBidIncrement(cb);
+        
+        // Local state update
+        setCurrentBid(newBid);
+        setBidLeader(bidder.id);
         setTimer(isAccelerated ? 8 : 15);
+        setNoBidYet(false);
+
+        // 👇 SYNC TO FIREBASE: Mobile-ku signal anupura idam
+        if (roomCode) {
+          updateRoomData(roomCode, {
+            auctionSync: {
+              currentBid: newBid,
+              bidLeader: bidder.id,
+              playerIdx: idx,
+              resetTimer: Date.now(), // Timer reset panna unique signal
+              teams: currentTeams.map(tm => ({
+                id: tm.id, budget: tm.budget, spent: tm.spent,
+                squad: tm.squad, _ov: tm._ov
+              }))
+            }
+          });
+        }
       }
     }, delay);
+
     return () => clearTimeout(aiRef.current);
-  }, [bidLeader, phase, screen, playerIdx, simulating, isAccelerated, finalizeWindow]);
+  }, [bidLeader, phase, screen, isHost]);
 
   // ── user bid ─────────────────────────────────────────────────────────────────
  function userBid() {
