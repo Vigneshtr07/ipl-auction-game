@@ -124,29 +124,45 @@ export default function App() {
   });
   // Firebase real-time room sync
  useEffect(() => {
-  if (!roomCode) return; // roomLobby check-ah remove pannuvom, appo dhaan ellamae sync aagum
+  if (!roomCode) return;
+  const unsubscribe = listenRoom(roomCode, (data) => {
+    setRoomData(data);
+    if (data?.players) setMultiTeams(data.players);
 
-  const unsubscribe = listenRoom(roomCode, (roomData) => {
-    // 1. Players list-ah sync pannum
-    if (roomData?.players) {
-      setMultiTeams(roomData.players);
-    }
-    
-    // 2. Room Lobby-la irundhu Retention/Auction-ku poga (Lobby Sync)
-    if (roomData?.status === 'started' && screen === 'roomLobby') {
-       setAuctionType(roomData.auctionType);
-       setScreen(roomData.auctionType === 'mega' ? 'retention' : 'auction');
+    if (!isHost) {
+      if (data?.status === 'retention' && screen === 'roomLobby') {
+        setAuctionType(data.auctionType);
+        setScreen('retention');
+      }
+      if (data?.status === 'auction' && screen !== 'auction') {
+        setAuctionType(data.auctionType);
+        // Pass playerOrder IDs and teams from Firebase!
+        startAuctionWithRetentions(
+          data.retentions || {},
+          data.playerOrder || [],   // ← same shuffled order
+          data.teams || []          // ← same team budgets
+        );
+      }
     }
 
-    // 3. 👇 IDHU DHAAN PUDHU CODE: Retention mudinju Auction-ku sync panna
-    // Room status 'auction_live' aana, automatic-ah screen 'auction'-ku maarum
-    if (roomData?.status === 'auction_live' && screen === 'retention') {
-       setScreen('auction');
+    // Sync ongoing auction state — bids, current player etc.
+    if (data?.auctionSync && screen === 'auction') {
+      const sync = data.auctionSync;
+      if (sync.currentBid !== undefined) setCurrentBid(sync.currentBid);
+      if (sync.bidLeader  !== undefined) setBidLeader(sync.bidLeader);
+      if (sync.playerIdx  !== undefined && sync.playerIdx !== playerIdx) {
+        setPlayerIdx(sync.playerIdx);
+      }
+      if (sync.teams) {
+        setTeams(TEAMS.map(tm => {
+          const fb = sync.teams.find(x => x.id === tm.id);
+          return fb ? { ...tm, ...fb } : tm;
+        }));
+      }
     }
   });
-
   return unsubscribe;
-}, [roomCode, screen]); // Dependency list-layum 'screen' irukanum
+}, [roomCode, isHost, screen]); // Dependency list-layum 'screen' irukanum
 // ── Firebase room sync ───────────────────────────────────────────────────────
 useEffect(() => {
   if (!roomCode) return;
@@ -227,14 +243,34 @@ useEffect(() => {
   return out;
 }
 // Start auction using retentions from Firebase (for non-host players)
-function startAuctionWithRetentions(retObj) {
-  const aiRet = auctionType === 'mega' ? buildAIRetentions(myTeamId, auctionType === 'mini' ? MINI_PLAYERS_2026 : MEGA_PLAYERS_2025) : {};
-  const fullRet = { ...aiRet, ...retObj };
-  const t = initTeams(fullRet);
+function startAuctionWithRetentions(retObj, playerOrderIds, firebaseTeams) {
+  const pool = auctionType === 'mini' ? MINI_PLAYERS_2026 : MEGA_PLAYERS_2025;
+
+  // Reconstruct player order using IDs from Firebase (same order as host!)
+  let ord;
+  if (playerOrderIds && playerOrderIds.length > 0) {
+    ord = playerOrderIds
+      .map(id => pool.find(p => p.id === id))
+      .filter(Boolean);
+  } else {
+    ord = buildOrder(retObj);
+  }
+
+  // Use teams state from Firebase
+  let t;
+  if (firebaseTeams && firebaseTeams.length > 0) {
+    t = TEAMS.map(tm => {
+      const fb = firebaseTeams.find(x => x.id === tm.id);
+      return fb ? { ...tm, ...fb } : { ...tm, squad: [], budget: TOTAL_BUDGET, spent: 0, _ov: 0 };
+    });
+  } else {
+    t = initTeams(retObj);
+  }
+
   setTeams(t);
-  setRetentions(fullRet);
-  const ord = buildOrder(fullRet);
-  setPlayers(ord); setPlayerIdx(0);
+  setRetentions(retObj);
+  setPlayers(ord);
+  setPlayerIdx(0);
   setSold([]); setUnsold([]);
   setIsAccelerated(false); setSimulating(false); setFinalizeWindow(false);
   setScreen('auction');
@@ -245,18 +281,25 @@ function startAuctionWithRetentions(retObj) {
   if (userRetObj[myTeamId]) fullRet[myTeamId] = userRetObj[myTeamId];
 
   const t = initTeams(fullRet);
+  const ord = buildOrder(fullRet); // shuffled order
+
   setTeams(t);
   setRetentions(fullRet);
-  const ord = buildOrder(fullRet);
-  setPlayers(ord); setPlayerIdx(0);
+  setPlayers(ord);
+  setPlayerIdx(0);
   setSold([]); setUnsold([]);
   setIsAccelerated(false); setSimulating(false); setFinalizeWindow(false);
 
-  // If multiplayer — save to Firebase and notify friends
   if (roomCode) {
+    // Save EVERYTHING to Firebase so all devices get same state
     updateRoomData(roomCode, {
       status: 'auction',
       retentions: fullRet,
+      playerOrder: ord.map(p => p.id), // save shuffled order as IDs
+      teams: t.map(tm => ({
+        id: tm.id, budget: tm.budget, spent: tm.spent,
+        squad: tm.squad, _ov: tm._ov
+      })),
     });
   }
 
@@ -306,6 +349,14 @@ function startAuctionWithRetentions(retObj) {
     setFinalizeWindow(false);
     const p = refs.current.players[refs.current.playerIdx];
     setUnsold(prev => [...prev, p]);
+    if (roomCode) {
+  updateRoomData(roomCode, {
+    auctionSync: {
+      playerIdx: refs.current.playerIdx,
+      lastResult: { type: 'unsold', playerName: pName(p) },
+    }
+  });
+}
     setTimeout(advance, 1600);
   }
 
@@ -330,22 +381,48 @@ function startAuctionWithRetentions(retObj) {
         setShowConfetti(true); setTimeout(() => setShowConfetti(false), 2500);
       }
     }
+    // Sync sold result to Firebase
+if (roomCode) {
+  updateRoomData(roomCode, {
+    auctionSync: {
+      currentBid: price,
+      bidLeader: leader,
+      playerIdx: refs.current.playerIdx,
+      lastResult: { type: 'sold', team: leader, price, playerName: pName(p) },
+      teams: refs.current.teams?.map(tm => ({
+        id: tm.id, budget: tm.budget, spent: tm.spent,
+        squad: tm.squad, _ov: tm._ov
+      }))
+    }
+  });
+}
     setTimeout(advance, 1800);
   }
+function advance() {
+  setPhase('bidding'); setGoingPhase(''); setFinalizeWindow(false);
+  setPlayerIdx(p => {
+    const next = p + 1;
 
-  function advance() {
-    setPhase('bidding'); setGoingPhase(''); setFinalizeWindow(false);
-    setPlayerIdx(p => {
-      const next = p + 1;
-      if (next >= refs.current.players.length) {
-        if (!refs.current.isAccelerated && refs.current.unsold.length > 0) {
-          setAccelSelectScreen(true); setAccelSelected([]); return p;
+    // Sync new playerIdx to Firebase
+    if (roomCode && isHost) {
+      updateRoomData(roomCode, {
+        auctionSync: {
+          playerIdx: next,
+          currentBid: refs.current.players[next]?.base || 0,
+          bidLeader: null,
         }
-        setScreen('summary'); return p;
+      });
+    }
+
+    if (next >= refs.current.players.length) {
+      if (!refs.current.isAccelerated && refs.current.unsold.length > 0) {
+        setAccelSelectScreen(true); setAccelSelected([]); return p;
       }
-      return next;
-    });
-  }
+      setScreen('summary'); return p;
+    }
+    return next;
+  });
+}
 
   // ── finalize with bid window ─────────────────────────────────────────────────
   function onFinalize() {
@@ -407,32 +484,41 @@ function startAuctionWithRetentions(retObj) {
   }, [bidLeader, phase, screen, playerIdx, simulating, isAccelerated, finalizeWindow]);
 
   // ── user bid ─────────────────────────────────────────────────────────────────
-  function userBid() {
-    if (phase !== 'bidding' || simulating) return;
-    const myTeam = refs.current.teams?.find(t => t.id === myTeamId);
-    const player = refs.current.players[refs.current.playerIdx];
-    if (!myTeam || !player) return;
-    if (myTeam.squad.length >= 25) { setBudgetErr('Squad full! (max 25)'); setTimeout(()=>setBudgetErr(''),2e3); return; }
-    if (isOverseas(player.country) && teamOverseas(myTeam) >= 8) { setBudgetErr('Max 8 overseas!'); setTimeout(()=>setBudgetErr(''),2e3); return; }
-    const newBid = refs.current.currentBid + getBidIncrement(refs.current.currentBid);
-    if (newBid > myTeam.budget) {
-      setShake(true); setBudgetErr('Budget thara illa!');
-      setTimeout(() => { setShake(false); setBudgetErr(''); }, 800); return;
-    }
-
-    // If in finalize window — cancel it
-    if (refs.current.finalizeWindow) {
-      clearInterval(finalizeRef.current);
-      setFinalizeWindow(false);
-    }
-    clearInterval(timerRef.current);
-    setCurrentBid(newBid); setBidLeader(myTeamId);
-    setNoBidYet(false); setTimer(isAccelerated ? 8 : 15);
-    setBidHistory(h => [...h, {
-      team: TEAMS.find(t => t.id === myTeamId)?.short,
-      bid: newBid, isHuman: true
-    }]);
+ function userBid() {
+  if (phase !== 'bidding' || simulating) return;
+  const myTeam = refs.current.teams?.find(t => t.id === myTeamId);
+  const player = refs.current.players[refs.current.playerIdx];
+  if (!myTeam || !player) return;
+  if (myTeam.squad.length >= 25) { setBudgetErr('Squad full!'); setTimeout(() => setBudgetErr(''), 2e3); return; }
+  if (isOverseas(player.country) && teamOverseas(myTeam) >= 8) { setBudgetErr('Max 8 overseas!'); setTimeout(() => setBudgetErr(''), 2e3); return; }
+  const newBid = refs.current.currentBid + getBidIncrement(refs.current.currentBid);
+  if (newBid > myTeam.budget) {
+    setShake(true); setBudgetErr('Budget thara illa!');
+    setTimeout(() => { setShake(false); setBudgetErr(''); }, 800); return;
   }
+  if (refs.current.finalizeWindow) {
+    clearInterval(finalizeRef.current); setFinalizeWindow(false);
+  }
+  clearInterval(timerRef.current);
+  setCurrentBid(newBid); setBidLeader(myTeamId);
+  setNoBidYet(false); setTimer(isAccelerated ? 8 : 15);
+  setBidHistory(h => [...h, { team: TEAMS.find(t => t.id === myTeamId)?.short, bid: newBid, isHuman: true }]);
+
+  // ← Sync bid to Firebase so all devices see it
+  if (roomCode) {
+    updateRoomData(roomCode, {
+      auctionSync: {
+        currentBid: newBid,
+        bidLeader: myTeamId,
+        playerIdx: refs.current.playerIdx,
+        teams: refs.current.teams?.map(tm => ({
+          id: tm.id, budget: tm.budget, spent: tm.spent,
+          squad: tm.squad, _ov: tm._ov
+        }))
+      }
+    });
+  }
+}
 
   // ── simulate set ─────────────────────────────────────────────────────────────
   function simulateSet() {
